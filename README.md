@@ -74,7 +74,7 @@ flowchart TD
     end
 
     MarkDates --> Cleanup["finally: DROP TABLE IF EXISTS new_daily_aggregates"]
-    Cleanup --> Ready["Subsequent GET /weekly-report (FREE: Rp 0.00)"]
+    Cleanup --> Ready["Subsequent GET /weekly-report: Rp 0.00 when all 14 dates materialized (scans only uncached non-delta dates)"]
 
     classDef paid fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff7ed;
     classDef atomic fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#eff6ff;
