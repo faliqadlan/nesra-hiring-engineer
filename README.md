@@ -1,153 +1,101 @@
-# Nesra Scale - Software Engineer Take-Home Task
+# Nesra Scale — Cost-Aware Weekly Reporting & Invalidation
 
-*Nesra, Surabaya. Please read the whole document before you start.*
+This repository implements the Nesra weekly reporting service with date-partitioned lazy daily aggregates, exact deduplication, and atomic delta invalidation.
 
-## 1. Welcome
+---
 
-Thank you for your interest in joining Nesra. This task is a small, realistic version of a problem we solve every day. We want to see how you think, not how many hours you can spend.
+## 1. Cache Design & Architecture
 
-- **Timebox:** about 2 to 3 hours of work. We give you a working starter, so your time goes into the interesting part: caching and invalidation.
-- **Suggested split:** 30 minutes looking at the data, 90 minutes on the cache and invalidation, 30 minutes on your README.
-- **Unfinished is OK.** If you run out of time, write down what is missing and how you would finish it.
+### Core Design Philosophy
+Reading raw rows via `scan_raw()` simulates partitioned analytical warehouse scans (like BigQuery), incurring Rp 0.05 per row for all shops on touched dates. To minimize cost and avoid scanning unnecessary dates:
+- **No full-dataset precompute at startup:** `startup()` only defines lightweight table schemas on DuckDB.
+- **Lazy daily aggregates per shop:** Instead of caching reports at the weekly level, raw product sales are aggregated daily per shop (`cache_daily(shop_id, date, revenue, units)`). A weekly report merely sums the cached daily totals for the requested week (and previous week for WoW).
+- **Date-level materialization tracking:** `cache_dates(date)` tracks materialized calendar dates. Unmaterialized dates are scanned on demand in a single consolidated scan.
+- **Strictly aggregate storage:** Raw product-level details (`product_id`, `category`, `ad_spend`, etc.) are never retained in persistent cache tables.
 
-## 2. About Nesra Scale
+### Cache Keys & Schemas
+- `cache_daily`: `PRIMARY KEY (shop_id, date)` storing `revenue BIGINT` and `units BIGINT`.
+- `cache_dates`: `PRIMARY KEY (date)` tracking dates whose raw data has already been read and aggregated into `cache_daily`.
 
-Nesra Scale is a marketing-data product. It collects shop, ads and sales data from marketplaces such as TikTok Shop and Shopee, and shows brands simple insights about their business.
+### Invalidation Algorithm (`on_delta_loaded`)
+When `POST /load-delta` is invoked:
+1. **Delta Date Discovery:** Delta is scanned via `scan_raw("delta")` to identify distinct dates present in the batch (`delta_dates`).
+2. **Partitioned Base Read:** The exact same subset of dates is retrieved from the base dataset using `scan_raw("base", delta_dates)`.
+3. **Atomic Replacement Semantics:**
+   - Base records are anti-joined with delta on `(shop_id, product_id, date)` to discard superseded base records.
+   - The remaining base rows and delta rows are combined via `UNION ALL`.
+   - Exact duplicate records are eliminated using `DISTINCT *`.
+   - Daily aggregates are computed per `(shop_id, date)` into a temporary table `new_daily_aggregates`.
+4. **Cache Replacement:** In DuckDB, existing entries in `cache_daily` for `delta_dates` are deleted and replaced with `new_daily_aggregates`.
+5. **Materialization Marker Update:** All `delta_dates` are recorded into `cache_dates` via `INSERT OR IGNORE`.
 
-In production we use **BigQuery + dbt** for data, **Prefect** for pipelines, and **Cloudflare Workers** for serving. BigQuery charges by how much data a query scans, so every unnecessary read costs real money. That is why this task is about one thing:
+---
 
-**Cost-aware caching: serve fast, correct reports while reading as little raw data as possible.**
+## 2. Benchmark Scorecard & Cost Analysis
 
-## 3. The data
-
-The data is in [`data/`](data/). One row is one product in one shop on one day. The column names, types and meanings are in [`data/data_dictionary.md`](data/data_dictionary.md).
-
-- **`shops_90d.csv.gz`** - 500 shops x 90 days of daily product sales, 21 December 2024 to 20 March 2025. It is based on real data, but masked (names, IDs and amounts are changed).
-- **`delta.csv.gz`** - new data that arrives after the first load. It contains new days, and also some **late corrections to older days**.
-
-**The data is real-world messy.** Look at it carefully before you trust it. Handle any problems in a sensible way, and write down what you found and what you decided.
-
-## 4. The starter
-
-The repository is a working Python service. You need [uv](https://docs.astral.sh/uv/) installed.
-
-```
-./run.sh                 # starts the service on http://localhost:8000
-uv run pytest            # runs the tests
-```
-
-| File | What it is |
-| :---- | :---- |
-| `app/raw.py` | **Done.** Loads the raw data, provides `scan_raw()`, and counts the scan cost. |
-| `app/main.py` | **Done.** The HTTP routes. |
-| `app/reports.py` | **Your work.** Three empty functions: `startup()`, `weekly_report()` and `on_delta_loaded()`. |
-| `tests/` | One example test to start from. |
-
-You can add files and helpers, and change the starter if you have a good reason. Say why in your README.
-
-## 5. What to build
-
-The service has this endpoint:
+### Official Benchmark (`measure.py`) Results
+The service passes all correctness checks and operates well within the Rp 20,000 budget:
 
 ```
-GET /shops/{shop_id}/weekly-report?week=YYYY-Www
+MEASURE PASS | fresh service required
+Cost Rp | before run 0.00 | phase1 11,308.15 | phase2 3,197.80 | total 14,505.95 | budget <20,000 PASS
+Before PASS | requests 7500 | correct 100.00% (7422/7422) | schema errors 0 | numeric failures 0 | stale keys 0 | decision-dependent 26 | diagnostic mismatches 0 | p50/p95 84.45/118.49 ms
+After PASS  | requests 6000 | correct 100.00% (5943/5943) | schema errors 0 | numeric failures 0 | stale keys 0 | decision-dependent 19 | diagnostic mismatches 0 | p50/p95 98.36/220.30 ms
+Efficiency  | within scan budget
 ```
 
-`week` is an ISO week, for example `2025-W11`. The JSON response must include:
+- **Phase 1 Scans:** 226,163 rows scanned across scored dates (W07 baseline through W12 partial) = **Rp 11,308.15**.
+- **Phase 2 Scans:** 17,458 delta rows + 46,498 touched base rows = 63,956 rows scanned = **Rp 3,197.80**.
+- **Lifetime Scan Cost:** **Rp 14,505.95** (Budget: < Rp 20,000).
 
-| Field | Type | Meaning |
-| :---- | :---- | :---- |
-| `revenue` | integer | Total revenue of the shop in that week |
-| `units` | integer | Total units sold in that week |
-| `revenue_wow_pct` | number or `null` | Week-over-week change in revenue, in percent |
+### Comparison against Naive Architecture
+In a naive setup without caching:
+- Every report request scans 14 days of partitioned raw data (~81,000 rows, or Rp 4,050 per request).
+- For the simulated benchmark workload (13,500 total requests):
+  - **Naive cost:** 13,500 * Rp 4,050 = **~Rp 54,675,000**.
+  - **Nesra cached cost:** **Rp 14,505.95**.
+  - **Cost reduction:** **99.97% reduction** in raw data scan spend.
 
-Nothing else is required. Do not spend time on extra fields.
+---
 
-These rules are fixed, because `measure.py` checks them:
+## 3. Data Issues & Decisions
 
-- **Weeks** are ISO weeks, Monday to Sunday.
-- **Partial weeks count.** `shops_90d.csv.gz` ends on Thursday 20 March 2025, so `2025-W12` has only 4 days of data before the delta arrives. Return the totals of the days that exist. Do not return `null` or an error for an incomplete week.
-- **A shop with no rows in a week** gets `revenue: 0` and `units: 0`, not an error.
-- **`revenue_wow_pct`** is `100 * (this week - previous week) / previous week`, using revenue. It is `null` when there is no previous week **or** when the previous week's revenue is 0.
+During data audit and verification of `shops_90d.csv.gz` and `delta.csv.gz`:
+1. **Exact Duplicate Rows:**
+   - The base dataset contains 69 exact duplicate records (516,213 physical rows vs. 516,144 distinct rows).
+   - *Resolution:* All scans perform `SELECT DISTINCT *` prior to grouping and summing. This deduplicates exact identical records without dropping legitimate distinct products on the same date.
+2. **Effective Merged Row Count:**
+   - Base physical rows total 516,213, while delta contains 17,458 physical rows.
+   - 12 base rows match delta on `(shop_id, product_id, date)` and are replaced by the anti-join (`516,213 - 12 = 516,201` surviving base rows).
+   - Combining surviving base rows and delta via `UNION ALL` yields `516,201 + 17,458 = 533,659` physical merged rows.
+   - Base contains 69 exact duplicate records (none of which coincide with the 12 replaced keys). Deduplicating exact identical records across the merged dataset (`SELECT DISTINCT *`) eliminates these 69 duplicate rows, resulting in an effective distinct merged count of exactly **533,590** rows (`533,659 - 69 = 533,590`).
+3. **Partial Calendar Weeks:**
+   - `2025-W12` contains only 4 days of data in base (March 17–20, 2025). The remaining days (March 21–23, 2025) arrive in delta.
+   - *Resolution:* Days are materialized dynamically; partial weeks report sums of available days without padding artificial zeroes or rejecting requests.
+4. **Historical Late Corrections & Cross-Week Dependencies:**
+   - Delta provides late corrections for W10 dates (March 7–8, 2025), impacting shops like `SHP141660`.
+   - *Resolution:* By storing daily aggregates and computing weekly reports on demand, updating W10 daily aggregates automatically updates W10 totals and the previous-week baseline for W11 WoW calculations without requiring separate weekly cache invalidation.
+5. **Negative Revenue & Price Anomalies:**
+   - 3 records in base exhibit negative prices/revenues (e.g. `SHP909583`, `SHP410771`, `SHP468596`).
+   - *Resolution:* In line with the specification and benchmark reference policy, these were preserved as delivered without arbitrary truncation.
 
-## 6. Pretend the database is expensive
+---
 
-In this task, reading raw data is "expensive", like BigQuery. `app/raw.py` already handles this for you:
+## 4. Trade-Offs
 
-- **`scan_raw(source, dates)` is the only way to read raw rows.** Do not read the raw tables or the CSV files anywhere else.
-- Like a BigQuery table partitioned by date, a scan pays for **every row on each date it reads, for all shops**, even if you only need one shop. The rate is Rp 0.05 per row.
-- Every scan is logged, and `GET /stats` returns the running totals.
+- **Daily vs. Weekly Aggregation:** Caching daily aggregates requires DuckDB to sum 7 rows per week at request time. However, this dramatically simplifies invalidation (updating a single date automatically corrects both its containing week and the subsequent week's WoW), completely preventing stale dependent metrics.
+- **Lazy vs. Full Startup Precomputation:** Scanning all 90 days of base data at startup would cost Rp 25,810.65 upfront—exceeding the entire benchmark budget before answering a single query. Lazy date materialization ensures scans only occur for actively queried date partitions.
 
-Reads from your own cache tables are free. Your cache must be **DuckDB tables holding aggregated results** (for example per shop and day, or per shop and week), not a copy of the raw rows.
+---
 
-## 7. Budget goal
+## 5. AI Assistance Disclosure
 
-Imagine this production load: a weekly report for **all 500 shops, every day, for one month**, each requested **20 times a day** (users refresh, share, open on mobile, and so on).
-
-`measure.py` simulates a small version of this. It requests weekly reports for every shop, calls `POST /load-delta`, requests them again, checks every answer and reads `GET /stats`. Run it against a **freshly started** service, because the cost counters start from zero:
-
-```
-./run.sh                                      # in one terminal
-uv run measure.py --url http://localhost:8000 # in another
-```
-
-It prints a scorecard and writes the details to `measure_result.json`.
-
-**Target: the run passes, with a total under Rp 20,000.** For scale, scanning raw data on every request costs tens of millions. Cheaper is better.
-
-## 8. Cache invalidation (the important part)
-
-New data arrives after reports are already cached. When `POST /load-delta` is called, the starter makes the delta available as source `"delta"` and calls your `on_delta_loaded()`. You must:
-
-1. Return only when your reports are up to date.
-2. Make **affected reports refresh** with the new correct numbers. This includes reports for **older weeks** that changed because of late corrections.
-3. Keep **unaffected reports cached**, so they cost **nothing** to serve again.
-
-A short test or log output that proves this is very welcome.
-
-## 9. Your README
-
-Replace this file with your own README. Keep it short; one page is enough. It must include:
-
-- **Cache design** - what you cache, the cache keys, precompute or on-demand, and what happens step by step when the delta arrives.
-- **Cost** - the `measure.py` scorecard, and a rough estimate of what a naive version (no cache) would cost, so we can compare.
-- **Data issues** - what problems you found in the data and how you handled them.
-- **Notes** - how you used AI tools (see below), and anything unfinished.
-
-## 10. AI tools
-
-AI tools (Codex, Claude Code, Cursor and others) are **allowed and expected**. We use them every day.
-
-- In your README, say **how** you used them: which tools, for which parts, and what you changed or fixed yourself.
-- You must be able to **explain and modify any line** of your code live in the interview.
-
-## 11. How to submit
-
-- Start from this repository: click **Use this template** on GitHub to create your own copy.
-- Push your work to a **public GitHub repository**.
-- Send the repository link to the email or WhatsApp this task came with.
-
-## 12. How we evaluate
-
-| Area | Weight | What we look for |
-| :---- | :---- | :---- |
-| Cache design & invalidation correctness | 40% | Sensible keys, precise invalidation (including late corrections), no stale reports, unaffected reports stay cached |
-| Cost | 25% | A passing `measure.py` run, smart choices to reduce scans, clear comparison with a naive version |
-| Code quality & correctness | 15% | Readable code, correct revenue, units and WoW, a test that shows invalidation works |
-| Data-issue handling | 10% | You noticed real problems, handled them sensibly, and documented your decisions |
-| README communication | 10% | Clear, honest and short, including trade-offs and what is unfinished |
-
-We value **clear thinking and honest trade-offs** more than lots of features.
-
-## 13. What happens next
-
-If your submission is a good fit, we will invite you to a **60-minute interview**:
-
-- You walk us through your solution.
-- We discuss how you work with AI tools.
-
-## 14. Questions
-
-If something is unclear, make a reasonable assumption, write it in your README, and continue. You can also reply to the email with questions.
-
-Good luck, and have fun!
+- **AI Tools Used:** Antigravity (Google DeepMind agentic coding assistant powered by Gemini 3.8 Flash).
+- **Assisted Areas:**
+  - Automated exploration and SQL queries for row counts, duplicates, and oracle edge cases.
+  - Test suite development in `tests/test_reports.py` targeting specific delta and WoW dependencies.
+  - Draft of README benchmark scorecard and architecture overview.
+- **Human Review & Author Verification:**
+  - Verified and confirmed the replacement semantics and deduplication order in DuckDB queries.
+  - Confirmed `533,590` merged distinct row count against physical delta and base row counts.
+  - Executed benchmark verification against the running service, ensuring 100% correctness and zero stale keys.
