@@ -1,42 +1,56 @@
-# Nesra Scale — Cost-Aware Weekly Reporting & Cache Invalidation
+# Nesra Scale — Layanan Laporan Mingguan & Cache Hemat Biaya
 
-A DuckDB-backed weekly reporting service that minimizes partitioned raw scan costs (`Rp 0.05/row`) through **lazy date-partition materialization**, **shop-day aggregate caching**, and **atomic delta invalidation**.
-
-| Metric | Official `measure.py` Result | Requirement |
-| :--- | :--- | :--- |
-| **Before-Delta Correctness** | **100.00%** (`7,422 / 7,422` checked; `0` schema/numeric errors) | 100% match |
-| **After-Delta Correctness** | **100.00%** (`5,943 / 5,943` checked; `0` stale keys) | 100% match, 0 stale |
-| **Lifetime Scan Cost** | **Rp 14,505.95** (`290,119` rows scanned; `Rp 5,494.05` under cap) | `< Rp 20,000` |
-| **Startup Precompute Cost** | **Rp 0.00** (`0` rows scanned at startup) | Lazy on-demand |
+Implementasi layanan laporan mingguan (*weekly report*) berbasis **FastAPI** dan **DuckDB** yang menekan biaya pemindaian data mentah (`Rp0,05/baris`) melalui **agregat harian per toko (*daily aggregate*)**, **materialisasi sesuai permintaan (*lazy materialization*)**, dan **pembaruan *delta* secara atomik**.
 
 ---
 
-## 1. Architecture & Request Flow
+## 1. Ringkasan Solusi dan Hasil Utama
 
-Reading raw data through `scan_raw(source, dates)` charges `Rp 0.05` for **every row on each touched date across all 500 shops**. Instead of caching pre-joined weekly reports or scanning all 90 days at startup (`Rp 25,810.65`, which would immediately exceed the `Rp 20,000` budget), `app/reports.py` caches **daily shop aggregates**:
+Pada arsitektur gudang data analitis seperti BigQuery, setiap pemindaian tabel mentah melalui `scan_raw(source, dates)` mengenakan biaya `Rp0,05` untuk **seluruh baris pada tanggal yang disentuh di semua 500 toko**, meskipun laporan hanya diminta untuk satu toko. Memindai seluruh data 90 hari saat *startup* akan langsung menghabiskan `Rp25.810,65` (`516.213` baris) dan melampaui batas anggaran `Rp20.000` sebelum melayani satu pun permintaan.
 
-- **`cache_daily(shop_id, date, revenue, units)`** — `PRIMARY KEY (shop_id, date)`. Stores only aggregated `BIGINT` totals per shop and calendar day (never raw product rows).
-- **`cache_dates(date)`** — `PRIMARY KEY (date)`. Tracks which calendar dates have been materialized into `cache_daily` (including dates that yielded zero raw rows).
+Solusi pada [`app/reports.py`](app/reports.py) menerapkan tiga strategi utama:
+1. **Materialisasi sesuai permintaan (*lazy materialization*):** Sistem hanya memindai dan mengolah tanggal yang belum tersedia di dalam cache ketika laporan diminta.
+2. **Penyimpanan agregat harian (*daily aggregate*):** Cache di DuckDB hanya menyimpan ringkasan total per toko per tanggal (`cache_daily`), bukan salinan baris produk mentah. Sekali suatu tanggal dipindai, hasilnya dapat digunakan oleh seluruh 500 toko tanpa pemindaian ulang.
+3. **Pembaruan *delta* terarah (*targeted invalidation*):** Saat `POST /load-delta` dipanggil, hanya tanggal-tanggal yang terdapat di dalam batch `delta` yang dipindai ulang dan diperbarui dalam satu transaksi atomik.
+
+| Metrik Evaluasi | Hasil Resmi `measure.py` | Target Nesra |
+| :--- | :--- | :--- |
+| **Akurasi Sebelum Delta** | **100,00%** (`7.422 / 7.422` terverifikasi; `0` error skema/numerik) | 100% sesuai |
+| **Akurasi Sesudah Delta** | **100,00%** (`5.943 / 5.943` terverifikasi; `0` *stale key*) | 100% sesuai, 0 basi |
+| **Total Biaya Pemindaian** | **Rp14.505,95** (`290.119` baris; hemat `Rp5.494,05` atau `27,47%` di bawah batas) | `< Rp20.000` |
+| **Biaya Saat Startup** | **Rp0,00** (`0` baris dipindai saat inisialisasi layanan) | Tanpa *full scan* awal |
+
+---
+
+## 2. Arsitektur dan Mekanisme Cache
+
+Saat layanan dijalankan, `startup()` hanya membuat dua tabel ringan di DuckDB tanpa memindai data mentah:
+- **`cache_daily(shop_id, date, revenue, units)`** — `PRIMARY KEY (shop_id, date)`. Menyimpan total pendapatan dan unit terjual per toko per hari (`BIGINT`). Detail level produk (`product_id`, `category`, `ad_spend`, dll.) tidak pernah disimpan di cache.
+- **`cache_dates(date)`** — `PRIMARY KEY (date)`. Mencatat tanggal kalender yang sudah dimaterialisasi ke dalam `cache_daily` (termasuk tanggal yang tidak memiliki baris transaksi agar tidak dipindai berulang).
+
+Setiap permintaan `weekly_report()` membutuhkan rentang 14 hari (7 hari minggu yang diminta + 7 hari minggu sebelumnya untuk menghitung **WoW** atau *Week-over-Week*, yaitu persentase perubahan pendapatan dibanding minggu lalu). Fungsi `_ensure_dates_materialized()` memeriksa `cache_dates`:
+- ***Cache hit*** (semua tanggal sudah ada di `cache_dates`): langsung membaca `cache_daily` tanpa biaya pemindaian (`Rp0,00`).
+- ***Cache miss*** (ada tanggal yang belum tersedia): hanya tanggal yang belum ada (`missing_dates`) yang dipindai satu kali melalui `scan_raw("base", missing_dates)`.
 
 ```mermaid
 flowchart TD
-    Req["GET /shops/{shop_id}/weekly-report?week=YYYY-Www"] --> Window["Compute 14 Required Dates (7 prev week + 7 target week)"]
-    Window --> Check{"Check cache_dates for missing_dates"}
+    Req["GET /shops/{shop_id}/weekly-report?week=YYYY-Www"] --> Window["Hitung 14 Tanggal (7 hari minggu lalu + 7 hari minggu ini)"]
+    Window --> Check{"Cek cache_dates untuk missing_dates"}
 
-    Check -- "All 14 dates present (Cache Hit: Rp 0.00)" --> QueryCache
-    Check -- "missing_dates found (Cache Miss)" --> RawScan["scan_raw('base', missing_dates) (PAID: Rp 0.05/row across all shops)"]
+    Check -- "Semua 14 tanggal tersedia (Cache Hit: Rp0,00)" --> QueryCache
+    Check -- "Ada tanggal belum tersedia (Cache Miss)" --> RawScan["scan_raw('base', missing_dates) (BERBIAYA: Rp0,05/baris untuk semua toko)"]
 
-    subgraph PaidPath ["Lazy Partition Materialization (_ensure_dates_materialized)"]
-        RawScan --> DedupAgg["SELECT DISTINCT * (exact dedup) + GROUP BY shop_id, date"]
-        DedupAgg --> Txn["Atomic Transaction (db.begin / db.commit; db.rollback on error)"]
+    subgraph PaidPath ["Materialisasi Partisi (_ensure_dates_materialized)"]
+        RawScan --> DedupAgg["SELECT DISTINCT * (deduplikasi) + GROUP BY shop_id, date"]
+        DedupAgg --> Txn["Transaksi Atomik (db.begin / db.commit; db.rollback jika gagal)"]
         Txn --> WriteCache["INSERT INTO cache_daily & INSERT INTO cache_dates"]
     end
 
     WriteCache --> QueryCache
 
-    subgraph FreePath ["Free Cached Serving (Rp 0.00)"]
-        QueryCache["Query cache_daily for shop_id (curr_week & prev_week sums)"] --> WoW["Compute revenue_wow_pct (null if prev_rev == 0)"]
-        WoW --> Resp["Return JSON: {revenue, units, revenue_wow_pct}"]
+    subgraph FreePath ["Pembacaan Cache Tanpa Biaya Raw Scan (Rp0,00)"]
+        QueryCache["Baca cache_daily untuk shop_id (jumlah minggu ini & minggu lalu)"] --> WoW["Hitung revenue_wow_pct (null jika prev_rev == 0)"]
+        WoW --> Resp["Kembalikan JSON: {revenue, units, revenue_wow_pct}"]
     end
 
     classDef paid fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff7ed;
@@ -50,31 +64,36 @@ flowchart TD
 
 ---
 
-## 2. Delta Invalidation & Cross-Week WoW Consistency
+## 3. Pembaruan Delta dan Konsistensi WoW
 
-When `POST /load-delta` is called, `raw.land_delta()` loads `delta.csv.gz` and invokes `reports.on_delta_loaded()` synchronously before returning. Only the specific calendar dates present in the delta batch (`delta_dates`) are re-scanned from `base` and recomputed; all other cached dates remain untouched.
+Secara umum cache bekerja secara *on-demand* (diproses saat ada request laporan). Pengecualiannya adalah pembaruan **delta**: sesuai kontrak `POST /load-delta`, fungsi `on_delta_loaded()` memproses pembaruan secara sinkron saat endpoint tersebut dipanggil agar seluruh laporan langsung mutakhir ketika respons dikembalikan:
+
+1. **Identifikasi tanggal terdampak:** Memindai `scan_raw("delta")` dan mengambil daftar tanggal unik (`delta_dates`, sebanyak 11 tanggal).
+2. **Pembacaan `base` terbatas:** Memindai `scan_raw("base", delta_dates)` khusus untuk 11 tanggal tersebut.
+3. **Penggantian berbasis *natural key* & deduplikasi:** Baris `base` yang memiliki pasangan `(shop_id, product_id, date)` di `delta` digantikan menggunakan operasi `ANTI JOIN` diikuti `UNION ALL`, lalu dideduplikasi dengan `SELECT DISTINCT *` dan diagregasi per `(shop_id, date)` ke tabel sementara `new_daily_aggregates`.
+4. **Transaksi atomik:** Di dalam blok `db.begin()` / `db.commit()` (dengan `db.rollback()` jika terjadi kegagalan), baris lama pada `delta_dates` dihapus dari `cache_daily`, agregat baru dimasukkan, dan `delta_dates` dicatat ke `cache_dates`.
 
 ```mermaid
 flowchart TD
-    Post["POST /load-delta -> on_delta_loaded()"] --> ScanDelta["1. scan_raw('delta') (PAID: 17,458 rows / Rp 872.90)"]
-    ScanDelta --> GetDates["Extract sorted DISTINCT delta_dates (11 dates)"]
-    GetDates --> ScanBase["2. scan_raw('base', delta_dates) (PAID: 46,498 rows / Rp 2,324.90)"]
+    Post["POST /load-delta -> on_delta_loaded()"] --> ScanDelta["1. scan_raw('delta') (BERBIAYA: 17.458 baris / Rp872,90)"]
+    ScanDelta --> GetDates["Ambil daftar tanggal unik delta_dates (11 tanggal)"]
+    GetDates --> ScanBase["2. scan_raw('base', delta_dates) (BERBIAYA: 46.498 baris / Rp2.324,90)"]
 
-    subgraph Merge ["3. Partition-Scoped Replacement & Deduplication"]
+    subgraph Merge ["3. Penggantian Natural Key & Agregasi Harian"]
         ScanBase --> AntiJoin["base ANTI JOIN delta USING (shop_id, product_id, date)"]
         AntiJoin --> UnionAll["UNION ALL SELECT * FROM delta"]
         UnionAll --> Distinct["SELECT DISTINCT * -> GROUP BY shop_id, date"]
         Distinct --> TempTable["CREATE TEMP TABLE new_daily_aggregates"]
     end
 
-    subgraph AtomicSwap ["4. Atomic Cache Refresh (db.begin / commit / rollback)"]
+    subgraph AtomicSwap ["4. Pembaruan Cache Atomik (db.begin / commit / rollback)"]
         TempTable --> DeleteOld["DELETE FROM cache_daily WHERE date IN (delta_dates)"]
         DeleteOld --> InsertNew["INSERT INTO cache_daily SELECT * FROM new_daily_aggregates"]
         InsertNew --> MarkDates["INSERT OR IGNORE INTO cache_dates VALUES (delta_dates)"]
     end
 
     MarkDates --> Cleanup["finally: DROP TABLE IF EXISTS new_daily_aggregates"]
-    Cleanup --> Ready["Subsequent GET /weekly-report: Rp 0.00 when all 14 dates materialized (scans only uncached non-delta dates)"]
+    Cleanup --> Ready["GET /weekly-report berikutnya: Rp0,00 jika 14 tanggal sudah di-cache (hanya memindai tanggal non-delta yang belum di-cache)"]
 
     classDef paid fill:#7c2d12,stroke:#f97316,stroke-width:2px,color:#fff7ed;
     classDef atomic fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#eff6ff;
@@ -87,23 +106,23 @@ flowchart TD
     class Post,GetDates,AntiJoin,UnionAll,Distinct,TempTable,Cleanup neutral;
 ```
 
-### Example: Why Daily Grain Solves Cross-Week WoW Invalidation
-In `delta.csv.gz`, product `PRD50443267` for shop `SHP141660` on **`2025-03-07` (`2025-W10`)** is corrected from `revenue = 540,000` (`3` units) to `revenue = 360,000` (`2` units). Because `weekly_report()` sums `cache_daily` dynamically for both the target week and previous week, refreshing `2025-03-07` in `cache_daily` automatically corrects **both** `2025-W10` revenue and `2025-W11` WoW without touching unaffected `2025-W11` dates:
+### Contoh Nyata: Koreksi Historis `2025-W10` yang Memperbarui WoW `2025-W11`
+Pada `delta.csv.gz`, produk `PRD50443267` milik toko `SHP141660` pada tanggal **`2025-03-07` (`2025-W10`)** dikoreksi dari `revenue = 540.000` (`3` unit) menjadi `revenue = 360.000` (`2` unit). Karena `weekly_report()` selalu menjumlahkan `cache_daily` untuk minggu berjalan dan minggu sebelumnya, pembaruan tanggal `2025-03-07` di `cache_daily` otomatis memperbarui pendapatan `2025-W10` **sekaligus** nilai `revenue_wow_pct` pada `2025-W11`:
 
-| Report Query (`SHP141660`) | Before Delta | After Delta | Why It Changed |
+| Laporan (`SHP141660`) | Sebelum Delta | Sesudah Delta | Penjelasan Perubahan |
 | :--- | ---: | ---: | :--- |
-| **`2025-W09`** (unaffected week) | `Rp 213,814,000` (`-51.61%` WoW) | `Rp 213,814,000` (`-51.61%` WoW) | Dates `2025-02-17..03-02` not in `delta_dates`; served from cache at `Rp 0.00`. |
-| **`2025-W10`** (contains `2025-03-07`) | `Rp 429,524,900` (`1,819` units) | `Rp 429,344,900` (`1,818` units) | `2025-03-07` daily aggregate reduced by `Rp 180,000` (`1` unit). |
-| **`2025-W11`** (subsequent week) | `Rp 284,327,800` (**`-33.80%`** WoW) | `Rp 284,327,800` (**`-33.78%`** WoW) | W11 revenue unchanged, but previous-week baseline (`W10`) updated in `cache_daily`. |
-| **`2025-W12`** (partial → full week) | `Rp 493,166,800` (`4` days) | `Rp 869,744,300` (`7` days, `+205.89%` WoW) | Delta adds `2025-03-21..23` (`17,446` new rows across shops). |
+| **`2025-W09`** (minggu tidak terdampak) | `Rp213.814.000` (`-51,61%` WoW) | `Rp213.814.000` (`-51,61%` WoW) | Tanggal `2025-02-17..03-02` tidak ada di `delta_dates`; tetap dilayani dari cache (`Rp0,00`). |
+| **`2025-W10`** (memuat `2025-03-07`) | `Rp429.524.900` (`1.819` unit) | `Rp429.344.900` (`1.818` unit) | Agregat harian `2025-03-07` berkurang `Rp180.000` dan `1` unit. |
+| **`2025-W11`** (minggu berikutnya) | `Rp284.327.800` (**`-33,80%`** WoW) | `Rp284.327.800` (**`-33,78%`** WoW) | Pendapatan W11 tetap, tetapi pembanding minggu lalu (`W10`) di `cache_daily` telah diperbarui. |
+| **`2025-W12`** (minggu parsial → penuh) | `Rp493.166.800` (`4` hari) | `Rp869.744.300` (`7` hari, `+205,89%` WoW) | Delta menambahkan data tanggal `2025-03-21..23` (`17.446` baris baru). |
 
 ---
 
-## 3. Benchmark Scorecard & Cost Analysis
+## 4. Hasil Benchmark dan Efisiensi Biaya
 
-![Official Benchmark Scan Cost Breakdown showing Phase 1 Rp 11,308.15, Phase 2 Rp 3,197.80, and Total Rp 14,505.95 against the Rp 20,000 budget](docs/assets/scan-cost.svg)
+![Grafik rincian biaya pemindaian benchmark resmi Nesra sebesar Rp14.505,95 dibanding batas anggaran Rp20.000](docs/assets/scan-cost.svg)
 
-### Official `measure.py` Scorecard (Fresh Service)
+### Output Asli `measure.py` (Layanan Baru / Fresh Service)
 ```text
 MEASURE PASS | fresh service required
 Cost Rp | before run 0.00 | phase1 11,308.15 | phase2 3,197.80 | total 14,505.95 | budget <20,000 PASS
@@ -112,57 +131,62 @@ After PASS  | requests 6000 | correct 100.00% (5943/5943) | schema errors 0 | nu
 Efficiency  | within scan budget
 ```
 
-### Measured Scan Cost vs. Analytical Naive Estimates
-*Note: The cached figures below are measured directly by `measure.py`; the naive figures are analytical estimates assuming no cache where each request scans 14 days of raw data (~81,000 rows ≈ Rp 4,050/request).*
+### Perbandingan Biaya Terukur vs. Estimasi Analitis Tanpa Cache
+*Catatan: Biaya dengan cache pada skenario pertama merupakan hasil pengukuran langsung dari `measure.py`, sedangkan biaya tanpa cache adalah estimasi analitis dengan asumsi setiap request memindai 14 hari data mentah (~81.000 baris atau ~Rp4.050 per request).*
 
-| Scenario | Requests | Uncached Estimate (No Cache) | Measured / Projected Cached Cost | Savings |
+| Skenario Beban Kerja | Jumlah Request | Estimasi Analitis Tanpa Cache | Biaya dengan Cache | Penghematan |
 | :--- | ---: | ---: | ---: | ---: |
-| **Benchmark (`measure.py`)** | `13,500` | `~Rp 54,675,000` (estimate) | **Rp 14,505.95** (measured: `290,119` rows) | **99.97%** |
-| **1-Month Production Load** (`500 shops × 30d × 20/day`) | `300,000` | `~Rp 1,215,000,000` (estimate) | **< Rp 15,000** (30 daily partitions + delta) | **99.999%** |
+| **Benchmark Resmi (`measure.py`)** | `13.500` | `~Rp54.675.000` (estimasi) | **Rp14.505,95** (terukur: `290.119` baris) | **99,97%** |
+| **Ilustrasi Beban 1 Bulan** (`500 toko × 30 hari × 20/hari`) | `300.000` | `~Rp1.215.000.000` (estimasi) | **< Rp15.000** (estimasi 30 partisi harian + delta) | **99,999%** |
 
 ---
 
-## 4. Data Issues Found & Handling Decisions
+## 5. Temuan Kualitas Data
 
-| Issue in `shops_90d.csv.gz` / `delta.csv.gz` | Dataset Evidence | Handling Decision |
+Pemeriksaan terhadap [`data/shops_90d.csv.gz`](data/shops_90d.csv.gz) dan [`data/delta.csv.gz`](data/delta.csv.gz) menemukan sejumlah anomali data dunia nyata:
+
+| Masalah Kualitas Data | Bukti pada Dataset | Keputusan Penanganan |
 | :--- | :--- | :--- |
-| **Exact Duplicate Rows** | `69` extra identical rows in `base` (`516,213` physical vs. `516,144` distinct) across 4 shop-days: `SHP285014` (`2025-02-14`: 37), `SHP866221` (`2025-02-17`: 7), `SHP422010` (`2025-02-28`: 12), `SHP332806` (`2025-03-10`: 13). | Deduplicate exact rows via `SELECT DISTINCT *` before aggregating (`533,590` distinct merged rows after replacing `12` base keys with `17,458` delta rows). |
-| **Late Historical Corrections** | `12` rows in `delta` match `base` on `(shop_id, product_id, date)` across 8 dates in `W10` (`03-07`, `03-08`), `W11` (`03-10`, `03-11`, `03-13`, `03-14`), and `W12` (`03-17`, `03-19`). `9` change revenue/units; `3` re-deliver identical values. | Replace matching `(shop_id, product_id, date)` keys via `base ANTI JOIN delta USING (shop_id, product_id, date) UNION ALL SELECT * FROM delta`. |
-| **Partial Calendar Week (`2025-W12`)** | `base` ends Thursday `2025-03-20` (4 days of `W12`); `delta` delivers Friday–Sunday `2025-03-21..23` (`17,446` rows). | Sum available days in the Monday–Sunday window (`coalesce(sum(...), 0)`), recording all 7 dates in `cache_dates` so missing future days are not re-scanned on every request. |
-| **Negative Price & Revenue** | `3` rows in `base` have negative `price` and `revenue`: `SHP909583` (`2025-01-14`), `SHP410771` (`2025-02-12`), `SHP468596` (`2025-03-18`). | Preserve as delivered (refund/adjustment entries; required by `measure.py` reference oracle). |
-| **Zero-Price Units & `NULL` `ad_spend`** | `3` rows in `base` have `price = 0, revenue = 0, units_sold > 0` (`SHP625423`, `SHP135948`, `SHP980903`); `3,599` base rows (`SHP042488`, `SHP483681`, `SHP860524`) and `119` delta rows have `ad_spend IS NULL`. | Do not filter out zero-price rows or rows with `NULL` non-key columns, avoiding silent undercounting of `units` or `revenue`. |
+| **Duplikat Baris Identik** | Terdapat `69` baris duplikat identik di `base` (`516.213` baris fisik vs. `516.144` baris unik) pada 4 kombinasi toko-tanggal: `SHP285014` (`2025-02-14`: 37 baris ekstra), `SHP866221` (`2025-02-17`: 7), `SHP422010` (`2025-02-28`: 12), dan `SHP332806` (`2025-03-10`: 13). | Gunakan `SELECT DISTINCT *` sebelum agregasi (`533.590` baris unik gabungan setelah mengganti `12` baris `base` dengan `17.458` baris `delta`). |
+| **Koreksi Historis Terlambat** | `12` baris pada `delta` memiliki kunci `(shop_id, product_id, date)` yang sama dengan `base` pada 8 tanggal di `W10` (`03-07`, `03-08`), `W11` (`03-10`, `03-11`, `03-13`, `03-14`), dan `W12` (`03-17`, `03-19`). Sebanyak `9` baris mengubah nilai `revenue`/`units_sold`, sedangkan `3` baris mengirim ulang nilai yang sama. | Ganti baris `base` yang cocok menggunakan `base ANTI JOIN delta USING (shop_id, product_id, date) UNION ALL SELECT * FROM delta`. |
+| **Minggu Kalender Parsial (`2025-W12`)** | Data `base` berakhir pada Kamis `2025-03-20` (baru mencakup 4 hari di `W12`); sisa 3 hari (`2025-03-21..23`, `17.446` baris) baru masuk melalui `delta`. | Jumlahkan tanggal yang tersedia (`coalesce(sum(...), 0)`) dan catat ke-7 tanggal ke `cache_dates` agar tanggal yang belum memiliki data tidak memicu pemindaian ulang pada request berikutnya. |
+| **Harga & Pendapatan Negatif** | `3` baris pada `base` memiliki `price` dan `revenue` negatif: `SHP909583` (`2025-01-14`), `SHP410771` (`2025-02-12`), dan `SHP468596` (`2025-03-18`). | Dipertahankan apa adanya sesuai kebijakan referensi (merepresentasikan penyesuaian/retur). |
+| **Harga Nol (Unit Promosi) & `ad_spend` Bernilai `NULL`** | `3` baris pada `base` memiliki `price = 0` dan `revenue = 0` tetapi `units_sold > 0` (`SHP625423`, `SHP135948`, `SHP980903`); serta `3.599` baris `base` (`SHP042488`, `SHP483681`, `SHP860524`) dan `119` baris `delta` memiliki `ad_spend IS NULL`. | Tidak memfilter baris berharga nol maupun baris dengan kolom non-kunci `NULL`, sehingga jumlah `units` dan `revenue` tidak berkurang secara keliru. |
 
 ---
 
-## 5. Trade-Offs & Limitations
+## 6. Trade-off dan Keterbatasan
 
-- **Daily (`shop_id, date`) vs. Weekly (`shop_id, week`) Cache Grain:** Summing up to 7 daily rows per week in DuckDB takes `< 1 ms`, while allowing delta invalidation to re-scan only the exact modified dates (`11` dates) rather than full 7-day weeks, and automatically keeping subsequent-week WoW percentages consistent.
-- **Lazy vs. Eager Startup Materialization:** `startup()` creates empty schemas (`Rp 0.00`), ensuring unqueried historical dates (`2024-12-21` through `2025-02-09`) are never scanned during the benchmark.
-- **Starter Scope Limitations:**
-  - `app/raw.py` uses an in-memory DuckDB connection (`duckdb.connect()`), so cache state and scan counters reset on process restart.
-  - `app/main.py` serializes requests with a single `threading.RLock` (`raw.lock`) because DuckDB connections are not thread-safe across concurrent writes.
-  - `raw.land_delta()` marks `"delta"` as landed before `on_delta_loaded()` runs and models a single delta batch per process lifetime.
+- **Agregat Harian (`shop_id, date`) vs. Agregat Mingguan (`shop_id, week`):** Menyimpan agregat harian membuat DuckDB perlu menjumlahkan hingga 7 baris per minggu saat pembacaan (`< 1 ms` di memori). Sebagai imbalannya, pembaruan `delta` cukup memindai ulang tanggal yang berubah (`11` tanggal) tanpa perlu memindai ulang seluruh hari dalam minggu terkait, sekaligus menjaga konsistensi perhitungan WoW minggu berikutnya.
+- **Materialisasi *On-Demand* vs. Precompute Saat Startup:** Dengan mengosongkan precompute saat `startup()`, tanggal-tanggal lama (`2024-12-21` s.d. `2025-02-09`) yang tidak pernah diminta selama pengujian tidak pernah dipindai.
+- **Keterbatasan Infrastruktur Starter:**
+  - **Penyimpanan *In-Memory*:** [`app/raw.py`](app/raw.py) menggunakan koneksi DuckDB di memori (`duckdb.connect()`), sehingga tabel cache dan penghitung biaya direset ketika proses layanan dimulai ulang.
+  - **Serialisasi Lock Tunggal:** Karena koneksi tunggal DuckDB tidak *thread-safe* untuk penulisan konkuren, [`app/main.py`](app/main.py) membungkus setiap panggilan laporan dan delta dengan `raw.lock` (`threading.RLock`).
+  - **Pemuatan Delta Satu Kali:** Fungsi `raw.land_delta()` pada starter hanya menerima satu pemuatan `delta` selama masa hidup proses dan menandai `"delta"` telah dimuat sebelum memanggil `on_delta_loaded()`.
 
 ---
 
-## 6. Reproducibility & Verification
+## 7. Cara Menjalankan dan Pengujian
+
+Pastikan [`uv`](https://docs.astral.sh/uv/) sudah terpasang di lingkungan Linux/WSL:
 
 ```bash
-# 1. Run unit, isolation, and transaction-rollback fault-injection tests (11 tests)
+# 1. Jalankan seluruh pengujian unit, isolasi urutan tes, dan fault-injection rollback (11 tes)
 uv run pytest -v
 
-# 2. Run official benchmark against a freshly started service
-./run.sh                                       # Terminal 1
-uv run measure.py --url http://127.0.0.1:8000  # Terminal 2
+# 2. Jalankan benchmark resmi measure.py terhadap layanan yang baru dijalankan
+./run.sh                                       # Terminal 1 (menjalankan server pada port 8000)
+uv run measure.py --url http://127.0.0.1:8000  # Terminal 2 (menjalankan verifikasi & scorecard)
 ```
 
 ---
 
-## 7. AI Assistance Disclosure
+## 8. Penggunaan AI dan Verifikasi
 
-- **Tools Used:**
-  - **ChatGPT:** Solution planning, architecture review, and Planner/Reviewer governance handoffs.
-  - **Antigravity:** DuckDB SQL implementation in `app/reports.py`, pytest isolation & fault-injection rollback suite in `tests/test_reports.py`, dataset anomaly inspection, benchmark execution, and README visual authoring.
-- **Verification Performed:**
-  - Audited all SQL queries, `ANTI JOIN` replacement keys, `SELECT DISTINCT *` deduplication, and `db.begin()` / `db.commit()` / `db.rollback()` atomicity against `measure.py` and the raw gzip files.
-  - Verified all 11 pytest tests (including reverse-order execution and mid-transaction failure injection) and confirmed `measure.py` passes at `100.00%` accuracy and `Rp 14,505.95` total scan cost.
+- **Peran Alat AI:**
+  - **ChatGPT:** Perencanaan arsitektur solusi, penyusunan kontrak kerja *Planner/Reviewer*, serta peninjauan desain pengujian dan dokumentasi.
+  - **Antigravity:** Implementasi query DuckDB dan transaksi pada [`app/reports.py`](app/reports.py), pembuatan suite pengujian isolasi dan *fault-injection rollback* pada [`tests/test_reports.py`](tests/test_reports.py), audit anomali dataset, eksekusi benchmark `measure.py`, serta pembuatan diagram dan dokumentasi README.
+- **Verifikasi Teknis yang Dilakukan:**
+  - Memvalidasi kecocokan logika deduplikasi (`SELECT DISTINCT *`) dan penggantian *delta* (`ANTI JOIN` pada `(shop_id, product_id, date)`) terhadap kebijakan referensi di [`measure.py`](measure.py).
+  - Menguji isolasi state antar-tes (termasuk eksekusi urutan terbalik) dan pembatalan transaksi atomik (`db.rollback()`) melalui simulasi kegagalan database di tengah transaksi.
+  - Menjalankan `measure.py` pada proses layanan baru dan mengonfirmasi hasil `PASS` dengan akurasi `100,00%` (sebelum dan sesudah delta), `0` *stale key*, dan total biaya `Rp14.505,95`.
