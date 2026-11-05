@@ -26,8 +26,9 @@ When `POST /load-delta` is invoked:
    - The remaining base rows and delta rows are combined via `UNION ALL`.
    - Exact duplicate records are eliminated using `DISTINCT *`.
    - Daily aggregates are computed per `(shop_id, date)` into a temporary table `new_daily_aggregates`.
-4. **Cache Replacement:** In DuckDB, existing entries in `cache_daily` for `delta_dates` are deleted and replaced with `new_daily_aggregates`.
-5. **Materialization Marker Update:** All `delta_dates` are recorded into `cache_dates` via `INSERT OR IGNORE`.
+4. **Transactional Cache Update:**
+   - Within an explicit DuckDB transaction (`db.begin()` ... `db.commit()` with `db.rollback()` on error), existing aggregates for `delta_dates` are deleted from `cache_daily`, `new_daily_aggregates` are inserted, and all `delta_dates` are committed into `cache_dates` simultaneously.
+   - A matching transaction pattern is applied in `_ensure_dates_materialized()`, ensuring aggregate insertion and date-marker registration are committed atomically without partial materialization.
 
 ---
 
@@ -90,12 +91,10 @@ During data audit and verification of `shops_90d.csv.gz` and `delta.csv.gz`:
 
 ## 5. AI Assistance Disclosure
 
-- **AI Tools Used:** Antigravity (Google DeepMind agentic coding assistant powered by Gemini 3.8 Flash).
-- **Assisted Areas:**
-  - Automated exploration and SQL queries for row counts, duplicates, and oracle edge cases.
-  - Test suite development in `tests/test_reports.py` targeting specific delta and WoW dependencies.
-  - Draft of README benchmark scorecard and architecture overview.
-- **Human Review & Author Verification:**
-  - Verified and confirmed the replacement semantics and deduplication order in DuckDB queries.
-  - Confirmed `533,590` merged distinct row count against physical delta and base row counts.
-  - Executed benchmark verification against the running service, ensuring 100% correctness and zero stale keys.
+- **AI Tools Used:**
+  - **ChatGPT:** High-level solution planning, architecture review, and handoff structuring.
+  - **Antigravity:** Local workspace execution, DuckDB query implementation, test writing, and benchmark execution.
+- **Human Review & Verification:**
+  - Inspected and verified DuckDB schema constraints and replacement anti-join semantics.
+  - Validated physical vs. distinct row counts (`533,590` effective merged rows) against raw gzip source data.
+  - Reviewed test assertions in `tests/test_reports.py` and benchmark scorecard outputs from `measure.py`.

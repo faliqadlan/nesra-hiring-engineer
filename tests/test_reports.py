@@ -1,17 +1,11 @@
 """Tests for weekly report calculations, deduplication, caching, and delta invalidation."""
 
-from datetime import date
+import subprocess
+import sys
 from fastapi.testclient import TestClient
 import pytest
 
 from app.main import app
-from app.raw import db
-
-
-@pytest.fixture(autouse=True)
-def reset_cache():
-    """Ensure clean cache tables before each test if needed."""
-    yield
 
 
 def test_stats_reports_rows_and_cost():
@@ -114,11 +108,35 @@ def test_delta_lifecycle_and_historical_invalidation():
 
 
 def test_delta_loaded_before_any_request():
-    """Verify system correctness when delta is loaded in a fresh state before any report query."""
-    # We can test querying another week after delta is loaded
-    with TestClient(app) as client:
-        # Query W09 for an unaffected shop
-        res = client.get("/shops/SHP141660/weekly-report?week=2025-W09").json()
-        assert res["revenue"] == 213814000
-        assert res["units"] == 864
-        assert pytest.approx(res["revenue_wow_pct"], abs=0.01) == -51.61
+    """Genuinely isolated test: delta arrives before the very first weekly report request.
+
+    Runs in a separate Python process to ensure fresh, unpolluted module-level
+    state (raw._landed, db tables, and scan counters).
+    """
+    code = """
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+
+with TestClient(app) as client:
+    # 1. Load delta immediately before querying any weekly reports
+    load_res = client.post('/load-delta').json()
+    assert load_res['loaded'] is True
+
+    # 2. Query W10 for SHP141660 - should immediately reflect delta correction
+    w10 = client.get('/shops/SHP141660/weekly-report?week=2025-W10').json()
+    assert w10['revenue'] == 429344900
+    assert w10['units'] == 1818
+
+    # 3. Query W12 - should include full week with delta dates
+    w12 = client.get('/shops/SHP141660/weekly-report?week=2025-W12').json()
+    assert w12['revenue'] == 869744300
+    assert w12['units'] == 3827
+    assert pytest.approx(w12['revenue_wow_pct'], abs=0.01) == 205.89
+
+    # 4. Repeated delta load returns loaded: False
+    repeat = client.post('/load-delta').json()
+    assert repeat['loaded'] is False
+"""
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, f"Subprocess failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"

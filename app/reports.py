@@ -49,19 +49,25 @@ def _ensure_dates_materialized(dates: list[date]) -> None:
 
     # Scan raw base for missing dates
     with scan_raw("base", missing_dates) as scan:
-        # Deduplicate exact records before aggregation, aggregate per shop and date
-        db.execute(f"""
-            INSERT INTO cache_daily
-            SELECT shop_id, date, sum(revenue)::BIGINT AS revenue, sum(units_sold)::BIGINT AS units
-            FROM (SELECT DISTINCT * FROM {scan})
-            GROUP BY shop_id, date
-        """)
-
-    # Mark all missing dates as materialized (even if some dates had zero rows)
-    db.execute(
-        f"INSERT INTO cache_dates VALUES {', '.join(['(?)'] * len(missing_dates))}",
-        missing_dates,
-    )
+        # Atomic transaction: commit daily aggregates and materialization markers together
+        db.begin()
+        try:
+            # Deduplicate exact records before aggregation, aggregate per shop and date
+            db.execute(f"""
+                INSERT INTO cache_daily
+                SELECT shop_id, date, sum(revenue)::BIGINT AS revenue, sum(units_sold)::BIGINT AS units
+                FROM (SELECT DISTINCT * FROM {scan})
+                GROUP BY shop_id, date
+            """)
+            # Mark all missing dates as materialized (even if some dates had zero rows)
+            db.execute(
+                f"INSERT INTO cache_dates VALUES {', '.join(['(?)'] * len(missing_dates))}",
+                missing_dates,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
 
 def weekly_report(shop_id: str, week_start: date) -> dict:
@@ -144,15 +150,19 @@ def on_delta_loaded() -> None:
             """)
 
     try:
-        # Atomically delete existing aggregates for affected dates and insert new ones
-        placeholders = ", ".join(["?"] * len(delta_dates))
-        db.execute(f"DELETE FROM cache_daily WHERE date IN ({placeholders})", delta_dates)
-        db.execute("INSERT INTO cache_daily SELECT * FROM new_daily_aggregates")
-
-        # Mark all delta_dates as materialized
-        db.execute(f"""
-            INSERT OR IGNORE INTO cache_dates
-            VALUES {', '.join(['(?)'] * len(delta_dates))}
-        """, delta_dates)
+        # Atomic transaction: delete existing aggregates, insert new ones, and update markers
+        db.begin()
+        try:
+            placeholders = ", ".join(["?"] * len(delta_dates))
+            db.execute(f"DELETE FROM cache_daily WHERE date IN ({placeholders})", delta_dates)
+            db.execute("INSERT INTO cache_daily SELECT * FROM new_daily_aggregates")
+            db.execute(f"""
+                INSERT OR IGNORE INTO cache_dates
+                VALUES {', '.join(['(?)'] * len(delta_dates))}
+            """, delta_dates)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     finally:
         db.execute("DROP TABLE IF EXISTS new_daily_aggregates")
