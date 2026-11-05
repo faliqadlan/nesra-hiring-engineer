@@ -51,11 +51,13 @@ Efficiency  | within scan budget
 
 ### Comparison against Naive Architecture
 In a naive setup without caching:
-- Every report request scans 14 days of partitioned raw data (~81,000 rows, or Rp 4,050 per request).
-- For the simulated benchmark workload (13,500 total requests):
-  - **Naive cost:** 13,500 * Rp 4,050 = **~Rp 54,675,000**.
-  - **Nesra cached cost:** **Rp 14,505.95**.
-  - **Cost reduction:** **99.97% reduction** in raw data scan spend.
+- Every report request scans 14 days of partitioned raw data (~81,000 rows, or ~Rp 4,050 per request).
+- **Benchmark workload (`measure.py` — 13,500 requests):**
+  - **Naive cost:** `13,500 × Rp 4,050` = **~Rp 54,675,000**.
+  - **Cached cost:** **Rp 14,505.95** (**99.97% reduction**).
+- **Simulated 1-month production load (500 shops × 30 days × 20 requests/day = 300,000 requests):**
+  - **Naive cost:** `300,000 × Rp 4,050` = **~Rp 1,215,000,000** (~Rp 1.22 billion/month).
+  - **Cached cost:** Scanning 30 daily partitions (~172,000 rows) + delta updates costs **< Rp 15,000/month** (**99.999% reduction**).
 
 ---
 
@@ -63,29 +65,39 @@ In a naive setup without caching:
 
 During data audit and verification of `shops_90d.csv.gz` and `delta.csv.gz`:
 1. **Exact Duplicate Rows:**
-   - The base dataset contains 69 exact duplicate records (516,213 physical rows vs. 516,144 distinct rows).
+   - The base dataset contains 69 exact duplicate records (516,213 physical rows vs. 516,144 distinct rows) across 4 shop-days (`SHP285014` on `2025-02-14`: 37 extra rows; `SHP866221` on `2025-02-17`: 7; `SHP422010` on `2025-02-28`: 12; `SHP332806` on `2025-03-10`: 13).
    - *Resolution:* All scans perform `SELECT DISTINCT *` prior to grouping and summing. This deduplicates exact identical records without dropping legitimate distinct products on the same date.
 2. **Effective Merged Row Count:**
-   - Base physical rows total 516,213, while delta contains 17,458 physical rows.
+   - Base physical rows total 516,213, while delta contains 17,458 physical rows (all distinct).
    - 12 base rows match delta on `(shop_id, product_id, date)` and are replaced by the anti-join (`516,213 - 12 = 516,201` surviving base rows).
    - Combining surviving base rows and delta via `UNION ALL` yields `516,201 + 17,458 = 533,659` physical merged rows.
-   - Base contains 69 exact duplicate records (none of which coincide with the 12 replaced keys). Deduplicating exact identical records across the merged dataset (`SELECT DISTINCT *`) eliminates these 69 duplicate rows, resulting in an effective distinct merged count of exactly **533,590** rows (`533,659 - 69 = 533,590`).
+   - Base contains 69 exact duplicate records (none of which coincide with the 12 replaced keys). Deduplicating exact identical records across the merged dataset (`SELECT DISTINCT *`) eliminates these 69 duplicate rows, resulting in an effective distinct merged count of **533,590** rows (`533,659 - 69 = 533,590`).
 3. **Partial Calendar Weeks:**
-   - `2025-W12` contains only 4 days of data in base (March 17–20, 2025). The remaining days (March 21–23, 2025) arrive in delta.
+   - `2025-W12` contains only 4 days of data in base (March 17–20, 2025). The remaining 3 days (March 21–23, 2025; 17,446 rows) arrive in delta.
    - *Resolution:* Days are materialized dynamically; partial weeks report sums of available days without padding artificial zeroes or rejecting requests.
 4. **Historical Late Corrections & Cross-Week Dependencies:**
-   - Delta provides late corrections for W10 dates (March 7–8, 2025), impacting shops like `SHP141660`.
-   - *Resolution:* By storing daily aggregates and computing weekly reports on demand, updating W10 daily aggregates automatically updates W10 totals and the previous-week baseline for W11 WoW calculations without requiring separate weekly cache invalidation.
-5. **Negative Revenue & Price Anomalies:**
-   - 3 records in base exhibit negative prices/revenues (e.g. `SHP909583`, `SHP410771`, `SHP468596`).
-   - *Resolution:* In line with the specification and benchmark reference policy, these were preserved as delivered without arbitrary truncation.
+   - Delta contains 12 historical rows across 8 dates in `2025-W10` (`2025-03-07`, `2025-03-08`), `2025-W11` (`2025-03-10`, `2025-03-11`, `2025-03-13`, `2025-03-14`), and `2025-W12` (`2025-03-17`, `2025-03-19`). Nine of these rows revise `revenue` and `units_sold` (e.g. `SHP141660` on `2025-03-07`), while 3 rows in `2025-W10` re-deliver unchanged values.
+   - *Resolution:* Storing daily aggregates and computing weekly reports on demand ensures that updating `delta_dates` in `cache_daily` automatically refreshes both the affected week's totals and the subsequent week's WoW baseline without re-scanning unaffected dates.
+5. **Negative Price & Revenue Records:**
+   - 3 records in base exhibit negative prices and revenues (`SHP909583` on `2025-01-14`, `SHP410771` on `2025-02-12`, and `SHP468596` on `2025-03-18`).
+   - *Resolution:* Preserved as delivered (consistent with adjustments/refunds and the benchmark reference policy).
+6. **Zero-Price Promotional / Sample Units & Nullable `ad_spend`:**
+   - 3 records in base (`SHP625423` on `2025-01-19`, `SHP135948` on `2025-01-24`, `SHP980903` on `2025-02-22`) have `price = 0` and `revenue = 0` with positive `units_sold` (6, 9, and 6 units).
+   - 3,599 records in base (`SHP042488`, `SHP483681`, `SHP860524`) and 119 records in delta have `ad_spend IS NULL`.
+   - *Resolution:* Aggregations do not filter out zero-price rows or rows with NULL non-key attributes, preventing silent undercounting of units or revenue.
 
 ---
 
-## 4. Trade-Offs
+## 4. Trade-Offs & Limitations
 
-- **Daily vs. Weekly Aggregation:** Caching daily aggregates requires DuckDB to sum 7 rows per week at request time. However, this dramatically simplifies invalidation (updating a single date automatically corrects both its containing week and the subsequent week's WoW), completely preventing stale dependent metrics.
-- **Lazy vs. Full Startup Precomputation:** Scanning all 90 days of base data at startup would cost Rp 25,810.65 upfront—exceeding the entire benchmark budget before answering a single query. Lazy date materialization ensures scans only occur for actively queried date partitions.
+### Trade-Offs
+- **Daily vs. Weekly Aggregation:** Caching daily aggregates requires DuckDB to sum up to 7 rows per week at request time (< 1 ms in-memory). In exchange, invalidation is exact at the date-partition grain: updating a date automatically corrects both its containing week and the following week's WoW baseline without re-scanning untouched days of either week.
+- **Lazy vs. Full Startup Precomputation:** Scanning all 90 days of base data at startup would scan 516,213 rows (Rp 25,810.65) upfront—exceeding the Rp 20,000 benchmark budget before serving a single request. Lazy date materialization ensures scans only occur for queried date partitions.
+
+### Known Starter / Scope Limitations
+- **In-Memory Ephemerality:** `app/raw.py` initializes an in-memory DuckDB connection (`duckdb.connect()`). Cache tables reset on process restart, which is expected for `measure.py` (where lifetime scan counters also reset to zero on a fresh service).
+- **Single-Connection Lock Serialization:** Because DuckDB connections are not thread-safe across concurrent writes, `app/main.py` serializes requests with `raw.lock` (`threading.RLock`).
+- **One-Shot Delta Landing:** `raw.land_delta()` in the starter marks `"delta"` as landed before `reports.on_delta_loaded()` runs and only supports a single delta batch per process lifetime.
 
 ---
 
@@ -93,8 +105,8 @@ During data audit and verification of `shops_90d.csv.gz` and `delta.csv.gz`:
 
 - **AI Tools Used:**
   - **ChatGPT:** High-level solution planning, architecture review, and handoff structuring.
-  - **Antigravity:** Local workspace execution, DuckDB query implementation, test writing, and benchmark execution.
-- **Human Review & Verification:**
-  - Inspected and verified DuckDB schema constraints and replacement anti-join semantics.
-  - Validated physical vs. distinct row counts (`533,590` effective merged rows) against raw gzip source data.
-  - Reviewed test assertions in `tests/test_reports.py` and benchmark scorecard outputs from `measure.py`.
+  - **Antigravity:** Local workspace execution, DuckDB query implementation, automated test suite & rollback fault-injection verification, and benchmark execution.
+- **Verification Performed:**
+  - Verified DuckDB schema constraints, replacement `ANTI JOIN` semantics, and explicit transaction rollback behavior (`db.begin()` / `db.commit()` / `db.rollback()`).
+  - Validated physical vs. distinct row counts (`533,590` effective merged rows) and data anomalies (`exact_duplicate`, negative price/revenue, zero-price units, `ad_spend IS NULL`) against the raw gzip source files.
+  - Executed `pytest` (including reverse-order isolation and fault-injection tests) and `measure.py` against a fresh service instance.
